@@ -11,9 +11,11 @@ using System.Reactive.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Websocket.Client;
+using System.Net;
 using System.Net.WebSockets;
 using System.Threading.Channels;
 using System.Buffers;
+using System.Text;
 
 namespace OpenAPI.Net
 {
@@ -30,6 +32,8 @@ namespace OpenAPI.Net
         private readonly CancellationTokenSource _cancellationTokenSource = new();
 
         private readonly TimeSpan _requestDelay;
+
+        private readonly WebProxy _proxy;
 
         private TcpClient _tcpClient;
 
@@ -51,7 +55,7 @@ namespace OpenAPI.Net
         /// <param name="heartbeatInerval">The time interval for sending heartbeats</param>
         /// <param name="maxRequestPerSecond">The maximum number of requests client will send per second</param>
         /// <param name="useWebSocket">By default OpenClient uses raw TCP connection, if you want to use web socket instead set this parameter to true</param>
-        public OpenClient(string host, int port, TimeSpan heartbeatInerval, int maxRequestPerSecond = 40, bool useWebSocket = false)
+        public OpenClient(string host, int port, TimeSpan heartbeatInerval, int maxRequestPerSecond = 40, bool useWebSocket = false, WebProxy proxy = null)
         {
             Host = host ?? throw new ArgumentNullException(nameof(host));
 
@@ -62,7 +66,8 @@ namespace OpenAPI.Net
             _heartbeatInerval = heartbeatInerval;
             MaxRequestPerSecond = maxRequestPerSecond;
             _requestDelay = TimeSpan.FromMilliseconds(1000 / MaxRequestPerSecond);
-            IsUsingWebSocket = useWebSocket;
+            _proxy = proxy;
+            IsUsingWebSocket = proxy == null && useWebSocket;
         }
 
         /// <summary>
@@ -122,7 +127,11 @@ namespace OpenAPI.Net
 
             try
             {
-                if (IsUsingWebSocket)
+                if (_proxy != null)
+                {
+                    await ConnectTcpViaSocks5Proxy();
+                }
+                else if (IsUsingWebSocket)
                 {
                     await ConnectWebScoket();
                 }
@@ -300,7 +309,15 @@ namespace OpenAPI.Net
         {
             var hostUri = new Uri($"wss://{Host}:{Port}");
 
-            _websocketClient = new WebsocketClient(hostUri, new Func<ClientWebSocket>(() => new ClientWebSocket()))
+            _websocketClient = new WebsocketClient(hostUri, new Func<ClientWebSocket>(() =>
+            {
+                var ws = new ClientWebSocket();
+                if (_proxy != null)
+                {
+                    ws.Options.Proxy = _proxy;
+                }
+                return ws;
+            }))
             {
                 IsTextMessageConversionEnabled = false,
                 ReconnectTimeout = null,
@@ -311,9 +328,9 @@ namespace OpenAPI.Net
             _webSocketMessageReceivedDisposable = _websocketClient.MessageReceived.Select(msg => ProtoMessage.Parser.ParseFrom(msg.Binary))
                 .Subscribe(OnNext);
 
-            _webSocketDisconnectionHappenedDisposable = _websocketClient.DisconnectionHappened.Subscribe(OnWebSocketDisconnectionHappened);
-
             await _websocketClient.StartOrFail();
+
+            _webSocketDisconnectionHappenedDisposable = _websocketClient.DisconnectionHappened.Subscribe(OnWebSocketDisconnectionHappened);
         }
 
         /// <summary>
@@ -331,6 +348,96 @@ namespace OpenAPI.Net
             await _sslStream.AuthenticateAsClientAsync(Host).ConfigureAwait(false);
 
             _ = Task.Run(() => ReadTcp(_cancellationTokenSource.Token));
+        }
+
+        /// <summary>
+        /// Connects to API via a SOCKS5 proxy tunnel (port 22228), then does SSL/TLS over the tunnel.
+        /// BrightData ISP proxies support all ports above 1024 via SOCKS5.
+        /// </summary>
+        /// <returns>Task</returns>
+        private async Task ConnectTcpViaSocks5Proxy()
+        {
+            var proxyHost = _proxy.Address.Host;
+            const int socks5Port = 22228;
+            var credential = _proxy.Credentials.GetCredential(_proxy.Address, "Basic");
+            var username = Encoding.ASCII.GetBytes(credential.UserName);
+            var password = Encoding.ASCII.GetBytes(credential.Password);
+
+            _tcpClient = new TcpClient { LingerState = new LingerOption(true, 10) };
+
+            // Connect to SOCKS5 proxy with 15s timeout
+            var connectTask = _tcpClient.ConnectAsync(proxyHost, socks5Port);
+            if (await Task.WhenAny(connectTask, Task.Delay(15000)).ConfigureAwait(false) != connectTask)
+            {
+                _tcpClient.Dispose();
+                throw new Exception($"SOCKS5 proxy connection to {proxyHost}:{socks5Port} timed out");
+            }
+            await connectTask.ConfigureAwait(false);
+
+            var stream = _tcpClient.GetStream();
+            stream.ReadTimeout = 15000;
+            stream.WriteTimeout = 15000;
+
+            // SOCKS5 greeting: version=5, 1 auth method, method=username/password (0x02)
+            await stream.WriteAsync(new byte[] { 0x05, 0x01, 0x02 }).ConfigureAwait(false);
+
+            var buf = new byte[2];
+            await ReadExactAsync(stream, buf, 2).ConfigureAwait(false);
+            if (buf[0] != 0x05 || buf[1] != 0x02)
+                throw new Exception("SOCKS5 proxy does not support username/password authentication");
+
+            // Auth: version=1, username length, username, password length, password
+            var auth = new byte[3 + username.Length + password.Length];
+            auth[0] = 0x01;
+            auth[1] = (byte)username.Length;
+            Buffer.BlockCopy(username, 0, auth, 2, username.Length);
+            auth[2 + username.Length] = (byte)password.Length;
+            Buffer.BlockCopy(password, 0, auth, 3 + username.Length, password.Length);
+            await stream.WriteAsync(auth).ConfigureAwait(false);
+
+            buf = new byte[2];
+            await ReadExactAsync(stream, buf, 2).ConfigureAwait(false);
+            if (buf[1] != 0x00)
+                throw new Exception($"SOCKS5 authentication failed (status: {buf[1]})");
+
+            // CONNECT: version=5, cmd=connect(1), rsv=0, atyp=domain(3), domain length, domain, port (big-endian)
+            var hostBytes = Encoding.ASCII.GetBytes(Host);
+            var connect = new byte[7 + hostBytes.Length];
+            connect[0] = 0x05;
+            connect[1] = 0x01;
+            connect[2] = 0x00;
+            connect[3] = 0x03;
+            connect[4] = (byte)hostBytes.Length;
+            Buffer.BlockCopy(hostBytes, 0, connect, 5, hostBytes.Length);
+            connect[5 + hostBytes.Length] = (byte)(Port >> 8);
+            connect[6 + hostBytes.Length] = (byte)(Port & 0xFF);
+            await stream.WriteAsync(connect).ConfigureAwait(false);
+
+            // Read CONNECT response (minimum 10 bytes for IPv4 bind address)
+            var resp = new byte[10];
+            await ReadExactAsync(stream, resp, 10).ConfigureAwait(false);
+            if (resp[1] != 0x00)
+                throw new Exception($"SOCKS5 CONNECT to {Host}:{Port} failed (status: {resp[1]})");
+
+            // Tunnel established — reset timeouts and do SSL/TLS
+            stream.ReadTimeout = 0;
+            stream.WriteTimeout = 0;
+
+            _sslStream = new SslStream(stream, false);
+            await _sslStream.AuthenticateAsClientAsync(Host).ConfigureAwait(false);
+
+            _ = Task.Run(() => ReadTcp(_cancellationTokenSource.Token));
+        }
+
+        private static async Task ReadExactAsync(NetworkStream stream, byte[] buffer, int count)
+        {
+            var read = 0;
+            while (read < count)
+            {
+                var n = await stream.ReadAsync(buffer, read, count - read).ConfigureAwait(false);
+                if (n == 0) throw new Exception("SOCKS5 proxy closed the connection");
+                read += n;
+            }
         }
 
         /// <summary>
