@@ -420,8 +420,8 @@ namespace OpenAPI.Net
                 throw new Exception($"SOCKS5 CONNECT to {Host}:{Port} failed (status: {resp[1]})");
 
             // Tunnel established — reset timeouts and do SSL/TLS
-            stream.ReadTimeout = 0;
-            stream.WriteTimeout = 0;
+            stream.ReadTimeout = Timeout.Infinite;
+            stream.WriteTimeout = Timeout.Infinite;
 
             _sslStream = new SslStream(stream, false);
             await _sslStream.AuthenticateAsClientAsync(Host).ConfigureAwait(false);
